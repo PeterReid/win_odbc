@@ -266,6 +266,48 @@ impl Statement {
         Ok( () )
     }
     
+    pub fn run_binary_select<F>(&mut self, sql: &str, mut f: F) -> OdbcResult<()>
+        where F: FnMut(Vec<&[u8]>)
+    {
+        try!(self.exec_direct(sql));
+        let result_col_count = try!(self.num_result_cols());
+        
+        let mut buffers: Vec<Vec<u8>> = (0..result_col_count).map(|_| {
+            iter::repeat(0).take(4096).collect()
+        }).collect();
+        
+        let mut buffer_lens: Vec<SQLLEN> = iter::repeat(255).take(buffers.len()*2).collect();
+        for (idx, buffer) in buffers.iter_mut().enumerate() {
+            if (ODBC_FNS.SQLBindCol)(self.stmt,
+                (idx+1) as SQLUSMALLINT,
+                -2, // SQL_C_BINARY
+                buffer.as_mut_ptr() as SQLPOINTER,
+                buffer.len() as i64,
+                unsafe { buffer_lens.as_mut_ptr().offset(idx as isize) }//idx as isize) }
+            ) != 0 {
+                return Err(Error{messages: vec!["BindCol failed".to_owned()]});
+            }
+        }
+        
+        loop {
+            if try!(unsafe { self.fetch() }) == false {
+                break;
+            }
+            
+            let result: Vec<&[u8]> = buffers.iter().zip(buffer_lens.iter()).map(|(buffer, buffer_len)| {
+                let truncated_len = min(*buffer_len as usize, buffer.len());
+                &buffer[0..truncated_len]
+            }).collect();
+            
+            f(result);
+        }
+        
+        (ODBC_FNS.SQLFreeStmt)(self.stmt, 2 /*SQL_UNBIND*/);
+        
+        Ok( () )
+    }
+    
+    
     fn num_result_cols(&self) -> OdbcResult<usize> {
         let mut result_cols: SQLSMALLINT = 0;
         let ret = (ODBC_FNS.SQLNumResultCols)(self.stmt, &mut result_cols);
@@ -364,33 +406,39 @@ fn sql_result<V>(value: V, err: SQLRETURN, handle_type: SQLSMALLINT, handle: SQL
     }
 }
 
+#[cfg(test)]
+mod test{
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    
+    fn go() -> OdbcResult<()> {
+        let env = try!(Env::new());
+        try!(env.set_int_attr(SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3));
+        
+        let conn = try!(Connection::new(&env));
+        
+        try!(conn.connect("Driver={SQL Server Native Client 11.0};Server=PL15\\SQLEXPRESS2012;Database=Reservation;Trusted_Connection=yes;MARS_Connection=yes"));
+        
+        let mut stmt = try!(Statement::new(&conn));
+        
+        let mut f = File::create("foo.sqlite3").unwrap();
+        try!(stmt.run_binary_select("select data from page inner join page_usage on page.id = page_usage.page_id and page_usage.snapshot_id = (SELECT TOP 1 id FROM snapshot ORDER BY time DESC) ORDER BY page_usage.page_index", |x| {
+            println!("{:?}", x);
+            f.write_all(x[0]).unwrap();
+        }));
+        
+        Ok( () )
+    }
 
-/*
-fn go() -> OdbcResult<()> {
-    let env = try!(Env::new());
-    try!(env.set_int_attr(SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3));
-    
-    let conn = try!(Connection::new(&env));
-    
-    try!(conn.connect("Driver={SQL Server Native Client 11.0};Server=PL15\\SQLEXPRESS2012;Database=FlightVectorOrnge5;Trusted_Connection=yes;MARS_Connection=yes"));
-    
-    
-    let mut stmt = try!(Statement::new(&conn));
-    
-    
-    try!(stmt.run_string_select("SELECT Name,Setting FROM Settings", |x| {
-        println!("{:?}", x);
-    }));
-    
-    Ok( () )
-}
-
-fn main() {
-    match go() {
-        Err(e) => {
-            println!("Failed: {:?}", e)
+    #[test]
+    fn simple() {
+        match go() {
+            Err(e) => {
+                println!("Failed: {:?}", e)
+            }
+            Ok( () ) => {}
         }
-        Ok( () ) => {}
+        panic!("See output");
     }
 }
-*/
